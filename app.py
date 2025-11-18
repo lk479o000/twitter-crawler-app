@@ -1,502 +1,393 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+import io
 import time
-import random
-import requests
-from bs4 import BeautifulSoup
-import json
+from datetime import datetime, timedelta
 
-# 设置页面
-st.set_page_config(
-    page_title="公司Twitter数据抓取",
-    page_icon="🐦",
-    layout="wide"
+import pandas as pd
+import requests
+import streamlit as st
+
+from twitter_crawler.data_prep import prepare_from_excel, normalize_company_name, read_first_column_as_list
+from twitter_crawler.twitter_api import TwitterAPI
+from twitter_crawler.accounts import search_account_for_company
+from twitter_crawler.sentiment import sentiment_score
+from twitter_crawler.storage import AccountInfo, save_accounts_csv, load_accounts_csv
+from twitter_crawler.utils_date import (
+    today_range, this_week_range, this_month_range, this_quarter_range,
+    this_half_year_range, this_year_range, recent_days_range
+)
+from twitter_crawler.config import get_settings, Settings
+
+
+st.set_page_config(page_title="推特抓取与分析工具", page_icon="🧩", layout="wide")
+st.title("🧩 推特抓取与分析工具（Streamlit）")
+st.caption("支持：数据准备、账号查找、推文抓取与情绪、数量查询、批量任务")
+
+# 侧边栏：API 与速率限制设置（显示默认值并允许修改）
+st.sidebar.header("API 与速率限制设置")
+default_settings = get_settings()
+if "api_settings" not in st.session_state:
+    st.session_state.api_settings = default_settings
+
+with st.sidebar.expander("查看/修改设置", expanded=True):
+    token = st.text_input("Bearer Token（留空则使用环境变量）", value="", type="password")
+    use_all = st.checkbox("使用全量历史 /tweets/search/all（需 Academic）", value=st.session_state.api_settings.use_search_all)
+    rpm = st.number_input("每分钟请求数（Requests Per Minute）", min_value=1, max_value=300, value=st.session_state.api_settings.requests_per_minute, step=1)
+    max_retries = st.number_input("最大重试次数", min_value=0, max_value=20, value=st.session_state.api_settings.rate_limit_max_retries, step=1)
+    base_delay = st.number_input("基础退避秒数", min_value=0.0, max_value=120.0, value=float(st.session_state.api_settings.rate_limit_base_delay_seconds), step=0.5)
+    max_delay = st.number_input("最大退避秒数", min_value=0.0, max_value=600.0, value=float(st.session_state.api_settings.rate_limit_max_delay_seconds), step=1.0)
+    apply_cfg = st.button("应用设置")
+    if apply_cfg:
+        st.session_state.api_settings = Settings(
+            twitter_bearer_token=token or default_settings.twitter_bearer_token,
+            use_search_all=use_all,
+            rate_limit_max_retries=int(max_retries),
+            rate_limit_base_delay_seconds=float(base_delay),
+            rate_limit_max_delay_seconds=float(max_delay),
+            requests_per_minute=int(rpm),
+        )
+        st.success("设置已应用")
+
+# 构造 API 客户端（使用当前设置）
+api = TwitterAPI(
+    bearer_token=st.session_state.api_settings.twitter_bearer_token,
+    settings=st.session_state.api_settings
 )
 
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "1：数据准备与清洗",
+    "2：推特账号查找与管理",
+    "3：推文抓取与情绪分析",
+    "4：推文数量查询",
+    "5：批量账号查找与管理",
+    "6：批量推文数量查询",
+    "7：批量推文内容查询"
+])
 
-class TwitterScraper:
-    def __init__(self):
-        self.company_handles = {
-            'AAPL': 'Apple',
-            'TSLA': 'Tesla',
-            'MSFT': 'Microsoft',
-            'GOOGL': 'Google',
-            'AMZN': 'Amazon',
-            'META': 'Meta',
-            'NFLX': 'Netflix',
-            'NVDA': 'NVIDIA',
-            'JPM': 'jpmorgan',
-            'JNJ': 'JNJNews',
-            'V': 'Visa',
-            'WMT': 'Walmart',
-            'DIS': 'Disney',
-            'BA': 'Boeing',
-            'INTC': 'Intel',
-            'CSCO': 'Cisco',
-            'IBM': 'IBM',
-            'GS': 'GoldmanSachs'
-        }
+with tab1:
+    st.subheader("1：数据准备与清洗")
+    excel_file = st.file_uploader("上传『推特公司样本.xlsx』", type=["xlsx"])
+    col_a, col_b = st.columns(2)
+    with col_a:
+        run_prep = st.button("开始清洗并生成映射")
+    if run_prep and excel_file:
+        with st.spinner("处理中..."):
+            buf = io.BytesIO(excel_file.read())
+            # 将上传文件写到临时 DataFrame 处理
+            df = pd.read_excel(buf, engine="openpyxl")
+            temp_path = "临时_推特公司样本.xlsx"
+            df.to_excel(temp_path, index=False)
+            unique_names, mapping = prepare_from_excel(temp_path, "normalized_companies.csv", "name_mapping.csv")
+        st.success(f"完成！标准化公司数：{len(unique_names)}")
+        st.download_button("下载 标准化公司列表 CSV", data=open("normalized_companies.csv","rb").read(), file_name="normalized_companies.csv")
+        st.download_button("下载 名称映射 CSV", data=open("name_mapping.csv","rb").read(), file_name="name_mapping.csv")
 
-    def get_company_twitter_handles(self):
-        """获取公司Twitter账号映射"""
-        return self.company_handles
-
-    def scrape_twitter_alternative(self, username, start_date, end_date, max_tweets=20):
-        """使用替代方法抓取真实Twitter数据"""
-        try:
-            st.info(f"正在抓取 @{username} 的真实数据...")
-
-            # 方法1: 使用 Nitter 镜像（Twitter的公开替代）
-            tweets = self.scrape_via_nitter(username, start_date, end_date, max_tweets)
-
-            if tweets:
-                return tweets
-
-            # 方法2: 使用公开API端点
-            st.warning(f"Nitter 抓取失败，尝试其他方法...")
-            tweets = self.scrape_via_public_api(username, max_tweets)
-
-            if tweets:
-                return tweets
-
-            # 方法3: 降级到模拟数据
-            st.error(f"无法获取 @{username} 的真实数据，使用高质量模拟数据")
-            return self.generate_high_quality_mock_data(username, start_date, end_date, max_tweets)
-
-        except Exception as e:
-            st.error(f"抓取 @{username} 时出错: {str(e)}")
-            return self.generate_high_quality_mock_data(username, start_date, end_date, max_tweets)
-
-    def scrape_via_nitter(self, username, start_date, end_date, max_tweets):
-        """通过 Nitter 镜像抓取数据"""
-        try:
-            # 使用 Nitter 实例（Twitter的公开镜像）
-            nitter_instances = [
-                "https://nitter.net",
-                "https://nitter.privacydev.net",
-                "https://nitter.poast.org"
-            ]
-
-            tweets = []
-
-            for instance in nitter_instances:
-                try:
-                    url = f"{instance}/{username}"
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    }
-
-                    response = requests.get(url, headers=headers, timeout=10)
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.content, 'html.parser')
-
-                        # 解析推文（Nitter 的HTML结构）
-                        tweet_elements = soup.find_all('div', class_='timeline-item')
-
-                        for i, tweet in enumerate(tweet_elements[:max_tweets]):
-                            try:
-                                content_elem = tweet.find('div', class_='tweet-content')
-                                if content_elem:
-                                    content = content_elem.get_text(strip=True)
-
-                                    # 获取互动数据
-                                    stats = tweet.find('div', class_='tweet-stats')
-                                    like_count = 0
-                                    retweet_count = 0
-
-                                    if stats:
-                                        like_elem = stats.find('span', class_='tweet-stat')
-                                        if like_elem:
-                                            like_text = like_elem.get_text(strip=True)
-                                            like_count = self.extract_number(like_text)
-
-                                    tweet_data = {
-                                        'tweet_id': f'nitter_{username}_{i}',
-                                        'username': username,
-                                        'content': content,
-                                        'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                        'timestamp': datetime.now(),
-                                        'like_count': like_count,
-                                        'retweet_count': retweet_count,
-                                        'reply_count': 0,
-                                        'quote_count': 0,
-                                        'view_count': 0,
-                                        'url': f"{instance}/{username}/status/{i}",
-                                        'has_media': False,
-                                        'language': 'en',
-                                        'source': 'nitter'
-                                    }
-                                    tweets.append(tweet_data)
-                            except Exception as e:
-                                continue
-
-                        if tweets:
-                            st.success(f"通过 Nitter 获取到 {len(tweets)} 条真实推文")
-                            return tweets
-
-                except Exception as e:
-                    continue
-
-            return []
-
-        except Exception as e:
-            return []
-
-    def scrape_via_public_api(self, username, max_tweets):
-        """通过公开API端点尝试抓取"""
-        try:
-            # 使用 Twitter 的公开嵌入API
-            embed_url = f"https://publish.twitter.com/oembed?url=https://twitter.com/{username}"
-
-            response = requests.get(embed_url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                # 这里可以解析返回的嵌入数据
-                # 但由于限制，通常只能获取有限信息
-                pass
-
-            return []
-        except:
-            return []
-
-    def extract_number(self, text):
-        """从文本中提取数字"""
-        try:
-            # 处理 "1.2K", "5M" 等格式
-            if 'K' in text:
-                return int(float(text.replace('K', '').strip()) * 1000)
-            elif 'M' in text:
-                return int(float(text.replace('M', '').strip()) * 1000000)
-            else:
-                return int(''.join(filter(str.isdigit, text)))
-        except:
-            return 0
-
-    def generate_high_quality_mock_data(self, username, start_date, end_date, max_tweets):
-        """生成高质量的模拟数据（当真实抓取失败时）"""
-        tweets = []
-        base_date = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
-        days_range = max(1, (end_date_obj - base_date).days)
-
-        # 基于真实公司数据的推文模板
-        real_tweet_templates = {
-            'Apple': [
-                "Introducing the new iPhone with revolutionary features",
-                "Our commitment to privacy and security continues",
-                "Apple Watch Series now available with health monitoring",
-                "iOS update brings new productivity features",
-                "Sustainability report: our environmental progress"
-            ],
-            'Tesla': [
-                "New software update improves autopilot performance",
-                "Gigafactory production reaches new milestones",
-                "Tesla Solar Roof now available in new regions",
-                "Charging network expansion continues globally",
-                "Quarterly vehicle delivery numbers announced"
-            ],
-            'Microsoft': [
-                "Windows 11 update with new AI features",
-                "Azure cloud services expand to new regions",
-                "LinkedIn reaches 1 billion members milestone",
-                "Xbox Game Pass new titles announced",
-                "Microsoft 365 Copilot now generally available"
-            ]
-        }
-
-        templates = real_tweet_templates.get(username, [
-            "Company earnings report shows strong growth",
-            "New product launch announcement",
-            "Sustainability and ESG initiatives update",
-            "Partnership with industry leaders",
-            "Corporate responsibility report published"
-        ])
-
-        num_tweets = min(max_tweets, 15)
-
-        for i in range(num_tweets):
-            tweet_date = base_date + timedelta(days=random.randint(0, days_range))
-
-            # 基于真实数据的互动范围
-            if username in ['Apple', 'Tesla', 'Microsoft']:
-                likes = random.randint(5000, 50000)
-                retweets = random.randint(500, 5000)
-                views = random.randint(100000, 1000000)
-            else:
-                likes = random.randint(1000, 20000)
-                retweets = random.randint(100, 2000)
-                views = random.randint(50000, 500000)
-
-            tweet_data = {
-                'tweet_id': f'realistic_{username}_{i}_{int(tweet_date.timestamp())}',
-                'username': username,
-                'content': f"{random.choice(templates)} - {tweet_date.strftime('%b %d')}",
-                'date': tweet_date.strftime('%Y-%m-%d %H:%M:%S'),
-                'timestamp': tweet_date,
-                'like_count': likes,
-                'retweet_count': retweets,
-                'reply_count': random.randint(50, 500),
-                'quote_count': random.randint(10, 200),
-                'view_count': views,
-                'url': f"https://twitter.com/{username}/status/real_{i}",
-                'has_media': random.choice([True, False]),
-                'language': 'en',
-                'source': 'simulated_real_data'
-            }
-            tweets.append(tweet_data)
-
-        tweets.sort(key=lambda x: x['timestamp'])
-        return tweets
-
-    def get_company_info(self, ticker):
-        """获取公司基本信息"""
-        company_names = {
-            'AAPL': 'Apple Inc.',
-            'TSLA': 'Tesla Inc.',
-            'MSFT': 'Microsoft Corporation',
-            'GOOGL': 'Alphabet Inc. (Google)',
-            'AMZN': 'Amazon.com Inc.',
-            'META': 'Meta Platforms Inc.',
-            'NFLX': 'Netflix Inc.',
-            'NVDA': 'NVIDIA Corporation',
-            'JPM': 'JPMorgan Chase & Co.',
-            'JNJ': 'Johnson & Johnson',
-            'V': 'Visa Inc.',
-            'WMT': 'Walmart Inc.',
-            'DIS': 'The Walt Disney Company',
-            'BA': 'The Boeing Company',
-            'INTC': 'Intel Corporation',
-            'CSCO': 'Cisco Systems, Inc.',
-            'IBM': 'International Business Machines Corporation',
-            'GS': 'The Goldman Sachs Group, Inc.'
-        }
-
-        return {
-            'ticker': ticker,
-            'company_name': company_names.get(ticker, f"{ticker} Corporation"),
-            'source': 'Company Database'
-        }
-
-
-def main():
-    st.title("🐦 美国上市公司Twitter数据抓取工具")
-    st.markdown("---")
-
-    # 初始化抓取器
-    scraper = TwitterScraper()
-
-    # 侧边栏配置
-    with st.sidebar:
-        st.header("⚙️ 抓取参数配置")
-
-        # 公司选择
-        st.subheader("选择公司")
-        company_handles = scraper.get_company_twitter_handles()
-
-        selected_companies = st.multiselect(
-            "选择要抓取的公司:",
-            options=list(company_handles.keys()),
-            format_func=lambda x: f"{x} - {company_handles[x]}",
-            default=['AAPL', 'TSLA', 'MSFT']
-        )
-
-        # 时间范围选择
-        st.markdown("---")
-        st.subheader("时间范围")
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "开始日期:",
-                value=datetime.now() - timedelta(days=30),
-                max_value=datetime.now()
-            )
-        with col2:
-            end_date = st.date_input(
-                "结束日期:",
-                value=datetime.now(),
-                max_value=datetime.now()
-            )
-
-        # 验证日期范围
-        if start_date > end_date:
-            st.error("❌ 开始日期不能晚于结束日期！")
-            return
-
-        # 其他参数
-        st.markdown("---")
-        st.subheader("抓取设置")
-        max_tweets = st.slider(
-            "每家公司最大推文数量:",
-            min_value=5,
-            max_value=50,
-            value=15,
-            step=5
-        )
-
-        st.markdown("---")
-        st.info("""
-        **数据来源说明:**
-        - 优先尝试真实Twitter数据抓取
-        - 使用Nitter镜像作为替代方案
-        - 如真实抓取失败，使用高质量模拟数据
-        - 所有数据基于真实公司推文模式
-        """)
-
-    # 主内容区域
-    col1, col2 = st.columns([2, 1])
-
+with tab2:
+    st.subheader("2：推特账号查找与管理")
+    st.caption("优先 verified；多结果可在 CLI 中确认。此处提供基础快速匹配。")
+    names_input = st.text_area("输入公司名称（每行一个）")
+    col1, col2 = st.columns(2)
     with col1:
-        st.header("📊 抓取控制")
-
-        # 显示配置摘要
-        st.subheader("当前配置")
-        summary_col1, summary_col2, summary_col3 = st.columns(3)
-        with summary_col1:
-            st.metric("选择公司数", len(selected_companies))
-        with summary_col2:
-            st.metric("时间范围", f"{(end_date - start_date).days} 天")
-        with summary_col3:
-            st.metric("最大推文数", max_tweets)
-
-        # 开始抓取按钮
-        st.markdown("---")
-        if st.button("🚀 开始抓取数据", type="primary", use_container_width=True):
-            if not selected_companies:
-                st.error("❌ 请至少选择一个公司！")
-                return
-
-            all_tweets = []
-            company_info_list = []
-
-            # 执行数据抓取
-            with st.spinner("正在抓取数据，请稍候..."):
-
-                # 获取公司信息
-                for ticker in selected_companies:
-                    with st.expander(f"{ticker} 公司信息", expanded=False):
-                        company_info = scraper.get_company_info(ticker)
-                        company_info_list.append(company_info)
-                        st.write(f"**公司名称:** {company_info['company_name']}")
-                        st.write(f"**股票代码:** {company_info['ticker']}")
-                        st.write(f"**Twitter账号:** @{company_handles.get(ticker, 'N/A')}")
-
-                # 抓取Twitter数据
-                for ticker in selected_companies:
-                    username = company_handles.get(ticker)
-                    if username:
-                        with st.expander(f"抓取 {ticker} (@{username}) 的推文", expanded=False):
-                            tweets = scraper.scrape_twitter_alternative(
-                                username=username,
-                                start_date=start_date.strftime("%Y-%m-%d"),
-                                end_date=end_date.strftime("%Y-%m-%d"),
-                                max_tweets=max_tweets
-                            )
-
-                            for tweet in tweets:
-                                tweet['company_ticker'] = ticker
-                                tweet['company_name'] = company_handles.get(ticker, ticker)
-                                all_tweets.append(tweet)
-
-                            # 显示数据来源
-                            if tweets and 'source' in tweets[0]:
-                                source = tweets[0]['source']
-                                if source == 'nitter':
-                                    st.success(f"✅ 通过Nitter抓取到 {len(tweets)} 条真实推文")
-                                elif source == 'simulated_real_data':
-                                    st.warning(f"⚠️ 使用高质量模拟数据 ({len(tweets)} 条)")
-                                else:
-                                    st.success(f"✅ 成功抓取 {len(tweets)} 条推文")
-
-                    # 公司间延迟
-                    time.sleep(1)
-
-            # 处理结果
-            if all_tweets:
-                results_df = pd.DataFrame(all_tweets)
-
-                # 显示结果统计
-                st.success(f"🎉 抓取完成！共获取 {len(results_df)} 条推文")
-
-                # 显示数据预览
-                st.subheader("📋 数据预览")
-
-                display_columns = ['company_ticker', 'company_name', 'username', 'date',
-                                   'content', 'like_count', 'retweet_count']
-                available_columns = [col for col in display_columns if col in results_df.columns]
-
-                st.dataframe(results_df[available_columns].head(10), use_container_width=True)
-
-                # 显示数据来源统计
-                st.subheader("📊 数据来源统计")
-                if 'source' in results_df.columns:
-                    source_counts = results_df['source'].value_counts()
-                    for source, count in source_counts.items():
-                        if source == 'nitter':
-                            st.info(f"🔗 Nitter真实数据: {count} 条")
-                        elif source == 'simulated_real_data':
-                            st.warning(f"📊 模拟数据: {count} 条")
-                        else:
-                            st.success(f"✅ {source}: {count} 条")
-
-                # 显示统计信息
-                st.subheader("📈 互动统计")
-                stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-                with stat_col1:
-                    st.metric("总推文数", len(results_df))
-                with stat_col2:
-                    st.metric("涉及公司数", results_df['company_ticker'].nunique())
-                with stat_col3:
-                    avg_likes = results_df['like_count'].mean()
-                    st.metric("平均点赞数", f"{avg_likes:.0f}")
-                with stat_col4:
-                    avg_retweets = results_df['retweet_count'].mean()
-                    st.metric("平均转推数", f"{avg_retweets:.0f}")
-
-                # 导出选项
-                st.subheader("💾 导出数据")
-                export_col1, export_col2, export_col3 = st.columns(3)
-
-                with export_col1:
-                    csv = results_df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        label="📥 下载CSV",
-                        data=csv,
-                        file_name=f"twitter_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-
-                # 保存到session state
-                st.session_state.results_df = results_df
-
-            else:
-                st.error("❌ 没有抓取到任何数据，请调整参数重试。")
-
+        run_find = st.button("查找账号")
     with col2:
-        st.header("📈 实时状态")
-
-        if 'results_df' in st.session_state:
-            st.success("✅ 上次抓取完成")
-            results_df = st.session_state.results_df
-
-            st.subheader("数据概览")
-            st.write(f"**总数据量:** {len(results_df)} 条推文")
-            st.write(f"**时间范围:** {results_df['date'].min().split()[0]} 至 {results_df['date'].max().split()[0]}")
-            st.write(f"**涉及公司:** {', '.join(results_df['company_ticker'].unique())}")
-
+        uploaded_map = st.file_uploader("导入现有账号映射 CSV（可选）", type=["csv"])
+    results_df = None
+    if run_find and names_input.strip():
+        names = [normalize_company_name(x) for x in names_input.splitlines() if x.strip()]
+        results: list[AccountInfo] = []
+        try:
+            with st.spinner("正在查找..."):
+                for comp in names:
+                    try:
+                        acc = search_account_for_company(api, comp)
+                        if acc:
+                            results.append(acc)
+                    except requests.exceptions.HTTPError as e:
+                        if "401" in str(e):
+                            st.error(f"认证失败：请检查Bearer Token是否有效。")
+                            break
+                        elif "429" in str(e):
+                            st.warning(f"查找{comp}时遇到速率限制，将暂停一段时间后继续...")
+                            time.sleep(5)  # 暂停5秒再继续
+                        else:
+                            st.warning(f"查找{comp}时出错：{str(e)}")
+                            continue
+        except Exception as e:
+            st.error(f"发生错误：{str(e)}")
+            st.stop()
+        if results:
+            results_df = pd.DataFrame([a.__dict__ for a in results])
+            st.dataframe(results_df, use_container_width=True)
+            save_accounts_csv(results, "company_account_map.csv")
+            st.download_button("下载账号映射 CSV", data=open("company_account_map.csv","rb").read(), file_name="company_account_map.csv")
         else:
-            st.info("⏳ 等待开始抓取...")
-            st.write("**抓取策略:**")
-            st.write("• 优先真实Twitter数据")
-            st.write("• Nitter镜像作为备选")
-            st.write("• 高质量模拟数据兜底")
+            st.info("未找到任何账号，请尝试不同名称。")
+    if uploaded_map is not None:
+        df_map = pd.read_csv(uploaded_map)
+        st.dataframe(df_map, use_container_width=True)
 
-        if st.button("🔄 清除缓存", use_container_width=True):
-            if 'results_df' in st.session_state:
-                del st.session_state.results_df
-            st.rerun()
+with tab3:
+    st.subheader("3：推文抓取与情绪分析")
+    by = st.selectbox("查询方式", ["按账号", "按关键字"])
+    value = st.text_input("账号（不含@）或关键字")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start_date = st.date_input("开始日期", datetime(2006,1,1).date())
+    with col2:
+        end_date = st.date_input("结束日期", datetime(2022,12,31).date())
+    with col3:
+        include_retweets = st.checkbox("包含转推", value=True)
+    run_fetch = st.button("抓取并分析")
+    if run_fetch and value.strip():
+        query = f"from:{value}" if by == "按账号" else value
+        if not include_retweets:
+            query += " -is:retweet"
+        start_iso = f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
+        end_iso = f"{end_date.strftime('%Y-%m-%d')}T23:59:59Z"
+        all_rows = []
+        try:
+            with st.spinner("抓取推文..."):
+                while True:
+                    try:
+                        resp = api.search_tweets(
+                            query=query,
+                            start_time=start_iso,
+                            end_time=end_iso,
+                            expansions=["author_id"],
+                            max_results=100,
+                        )
+                        data = resp.get("data", [])
+                        for t in data:
+                            text = t.get("text","").replace("\n", " ")
+                            all_rows.append({
+                                "公司名称": value if by == "按账号" else "",
+                                "推文内容": text,
+                                "发布时间": t.get("created_at"),
+                                "情绪分数": sentiment_score(text),
+                            })
+                        next_token = resp.get("meta", {}).get("next_token")
+                        if not next_token:
+                            break
+                    except requests.exceptions.HTTPError as e:
+                        if "401" in str(e):
+                            st.error(f"认证失败：请检查Bearer Token是否有效。")
+                            break
+                        elif "429" in str(e):
+                            st.warning("遇到速率限制，将暂停一段时间后继续...")
+                            time.sleep(10)  # 暂停10秒再继续
+                        else:
+                            st.error(f"抓取推文时出错：{str(e)}")
+                            break
+        except Exception as e:
+            st.error(f"发生错误：{str(e)}")
+            st.stop()
+        if all_rows:
+            out_df = pd.DataFrame(all_rows)
+            st.dataframe(out_df, use_container_width=True)
+            out_df.to_csv("tweets_with_sentiment.csv", index=False, encoding="utf-8")
+            st.download_button("下载结果 CSV", data=open("tweets_with_sentiment.csv","rb").read(), file_name="tweets_with_sentiment.csv")
+        else:
+            st.info("未抓取到推文。")
+
+with tab4:
+    st.subheader("4：推文数量查询模块")
+    st.caption("注：此处为近似统计，严格计数需分页累积或官方 counts 端点。")
+    company = st.text_input("公司账号（username，不含@）")
+    preset = st.selectbox("时间区间（预设）", ["", "当天", "这周", "当月", "当前季度", "当前半年", "今年"])
+    recent = st.selectbox("最近区间", ["", "最近一天", "最近一周", "最近一月", "最近一季度", "最近半年", "最近一年"])
+    run_count = st.button("查询")
+    if run_count and company.strip():
+        if preset:
+            mapping = {
+                "当天": today_range,
+                "这周": this_week_range,
+                "当月": this_month_range,
+                "当前季度": this_quarter_range,
+                "当前半年": this_half_year_range,
+                "今年": this_year_range,
+            }
+            start, end = mapping[preset]()
+        elif recent:
+            mapping_days = {
+                "最近一天": 1,
+                "最近一周": 7,
+                "最近一月": 30,
+                "最近一季度": 90,
+                "最近半年": 180,
+                "最近一年": 365,
+            }
+            start, end = recent_days_range(mapping_days[recent])
+        else:
+            st.warning("请选择预设或最近区间")
+            start = end = None
+        if start and end:
+            query = f"from:{company} -is:reply"
+            resp = api.search_tweets(query=query, start_time=start, end_time=end, max_results=100)
+            total = resp.get("meta", {}).get("result_count", 0)
+            st.metric("近似推文数量", total)
+
+with tab5:
+    st.subheader("5：批量账号查找与管理")
+    excel_batch = st.file_uploader("上传『推特公司样本.xlsx』", type=["xlsx"], key="batch_accounts_xlsx")
+    run_batch_accounts = st.button("批量查找")
+    if run_batch_accounts and excel_batch:
+        buf = io.BytesIO(excel_batch.read())
+        df = pd.read_excel(buf, engine="openpyxl")
+        temp_path = "临时_批量账号.xlsx"
+        df.to_excel(temp_path, index=False)
+        companies = read_first_column_as_list(temp_path)
+        results: list[AccountInfo] = []
+        error_count = 0
+        try:
+            with st.spinner("批量查找中..."):
+                for i, comp in enumerate(companies):
+                    try:
+                        acc = search_account_for_company(api, comp)
+                        if acc:
+                            results.append(acc)
+                    except requests.exceptions.HTTPError as e:
+                        if "401" in str(e):
+                            st.error(f"认证失败：请检查Bearer Token是否有效。")
+                            break
+                        elif "429" in str(e):
+                            st.warning(f"查找{comp}时遇到速率限制，将暂停一段时间后继续...")
+                            time.sleep(10)  # 暂停10秒再继续
+                            # 重试一次当前公司
+                            try:
+                                acc = search_account_for_company(api, comp)
+                                if acc:
+                                    results.append(acc)
+                            except Exception:
+                                error_count += 1
+                        else:
+                            error_count += 1
+                            st.warning(f"查找{comp}时出错：{str(e)}")
+                            continue
+        except Exception as e:
+            st.error(f"发生错误：{str(e)}")
+            st.stop()
+        if error_count > 0:
+            st.warning(f"完成批量查找，但有 {error_count} 个公司处理出错。")
+        if results:
+            out_df = pd.DataFrame([r.__dict__ for r in results])
+            out_df.to_csv("company_account_map.csv", index=False, encoding="utf-8")
+            st.dataframe(out_df, use_container_width=True)
+            st.download_button("下载账号映射 CSV", data=open("company_account_map.csv","rb").read(), file_name="company_account_map.csv")
+        else:
+            st.info("未找到任何账号。")
+
+with tab6:
+    st.subheader("6：批量推文数量查询（基于『推特公司样本_1570.xlsx』）")
+    excel_counts = st.file_uploader("上传 Excel（需包含公司名与日期两列）", type=["xlsx"], key="batch_counts_xlsx")
+    run_batch_counts = st.button("开始统计")
+    if run_batch_counts and excel_counts:
+        buf = io.BytesIO(excel_counts.read())
+        df = pd.read_excel(buf, engine="openpyxl")
+        company_col = df.columns[0]
+        date_col = df.columns[1]
+        rows = []
+        error_count = 0
+        try:
+            with st.spinner("统计中..."):
+                for i, row in df.iterrows():
+                    company = normalize_company_name(str(row[company_col]))
+                    the_date = pd.to_datetime(row[date_col]).date()
+                    try:
+                        # ±180 天
+                        start_iso = f"{(the_date - timedelta(days=180)).strftime('%Y-%m-%d')}T00:00:00Z"
+                        end_iso = f"{(the_date + timedelta(days=180)).strftime('%Y-%m-%d')}T23:59:59Z"
+                        query = f"from:{company} -is:reply"
+                        resp_180 = api.search_tweets(query=query, start_time=start_iso, end_time=end_iso, max_results=100)
+                        count_180 = resp_180.get("meta", {}).get("result_count", 0)
+                        # 当天
+                        day_start = f"{the_date.strftime('%Y-%m-%d')}T00:00:00Z"
+                        day_end = f"{the_date.strftime('%Y-%m-%d')}T23:59:59Z"
+                        resp_day = api.search_tweets(query=query, start_time=day_start, end_time=day_end, max_results=100)
+                        count_day = resp_day.get("meta", {}).get("result_count", 0)
+                        rows.append({"公司名称": company, "日期": str(the_date), "当天推文数": count_day, "±180天推文数": count_180})
+                    except requests.exceptions.HTTPError as e:
+                        if "401" in str(e):
+                            st.error(f"认证失败：请检查Bearer Token是否有效。")
+                            break
+                        elif "429" in str(e):
+                            st.warning(f"统计{company}时遇到速率限制，将暂停一段时间后继续...")
+                            time.sleep(15)  # 批量操作中暂停更久
+                            error_count += 1
+                        else:
+                            error_count += 1
+                            continue
+        except Exception as e:
+            st.error(f"发生错误：{str(e)}")
+            st.stop()
+        if error_count > 0:
+            st.warning(f"完成批量统计，但有 {error_count} 条记录处理出错。")
+        out_df = pd.DataFrame(rows)
+        out_df.to_csv("counts_结果.csv", index=False, encoding="utf-8")
+        st.dataframe(out_df, use_container_width=True)
+        st.download_button("下载统计结果 CSV", data=open("counts_结果.csv","rb").read(), file_name="counts_结果.csv")
+
+with tab7:
+    st.subheader("7：批量推文内容查询（基于『推特公司样本_详细.xlsx』）")
+    excel_contents = st.file_uploader("上传 Excel（需包含公司名与日期两列）", type=["xlsx"], key="batch_contents_xlsx")
+    window = st.number_input("窗口天数（±window）", value=180, min_value=1, max_value=365)
+    run_batch_contents = st.button("开始抓取")
+    if run_batch_contents and excel_contents:
+        buf = io.BytesIO(excel_contents.read())
+        df = pd.read_excel(buf, engine="openpyxl")
+        company_col = df.columns[0]
+        date_col = df.columns[1]
+        all_rows = []
+        error_count = 0
+        try:
+            with st.spinner("抓取中..."):
+                for i, row in df.iterrows():
+                    comp = normalize_company_name(str(row[company_col]))
+                    the_date = pd.to_datetime(row[date_col]).date()
+                    start_iso = f"{(the_date - timedelta(days=window)).strftime('%Y-%m-%d')}T00:00:00Z"
+                    end_iso = f"{(the_date + timedelta(days=window)).strftime('%Y-%m-%d')}T23:59:59Z"
+                    query = f"from:{comp}"
+                    try:
+                        has_next = True
+                        next_token = None
+                        while has_next:
+                            try:
+                                resp = api.search_tweets(
+                                    query=query, 
+                                    start_time=start_iso, 
+                                    end_time=end_iso, 
+                                    expansions=["author_id"], 
+                                    max_results=100,
+                                    next_token=next_token
+                                )
+                                data = resp.get("data", [])
+                                for t in data:
+                                    text = t.get("text","").replace("\n", " ")
+                                    all_rows.append({"公司名称": comp, "推文内容": text, "发布时间": t.get("created_at"), "情绪分数": sentiment_score(text)})
+                                next_token = resp.get("meta", {}).get("next_token")
+                                has_next = bool(next_token)
+                            except requests.exceptions.HTTPError as e:
+                                if "401" in str(e):
+                                    st.error(f"认证失败：请检查Bearer Token是否有效。")
+                                    has_next = False
+                                    break
+                                elif "429" in str(e):
+                                    st.warning(f"抓取{comp}的推文时遇到速率限制，将暂停一段时间后继续...")
+                                    time.sleep(20)  # 批量内容抓取暂停更久
+                                    continue  # 重试当前请求
+                                else:
+                                    st.warning(f"抓取{comp}的推文时出错：{str(e)}")
+                                    has_next = False
+                    except Exception as e:
+                        error_count += 1
+                        st.warning(f"处理{comp}时出错：{str(e)}")
+                        continue
+        except Exception as e:
+            st.error(f"发生错误：{str(e)}")
+            st.stop()
+        if error_count > 0:
+            st.warning(f"完成批量抓取，但有 {error_count} 个公司处理出错。")
+        out_df = pd.DataFrame(all_rows)
+        out_df.to_csv("contents_结果.csv", index=False, encoding="utf-8")
+        st.dataframe(out_df, use_container_width=True)
+        st.download_button("下载内容结果 CSV", data=open("contents_结果.csv","rb").read(), file_name="contents_结果.csv")
 
 
-if __name__ == "__main__":
-    main()
