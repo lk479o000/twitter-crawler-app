@@ -21,6 +21,10 @@ RATE_LIMIT_MAX_DELAY_SECONDS=60
 REQUESTS_PER_MINUTE=30
 ```
 
+注意：
+- Academic 权限：支持全量历史搜索（2006–现在），使用 `/tweets/search/all` 端点
+- Basic Plan：支持最近7天数据，使用 `/users/:id/tweets` 端点获取用户推文，每次最多返回100条
+
 ## 快速开始
 查看命令帮助：
 ```
@@ -69,7 +73,9 @@ python -m twitter_crawler.cli accounts edit --company "APPLE" --username "Apple"
 
 ### 扣子3：推文抓取与情绪分析
 - 支持按账号或关键字
-- 时间范围：2006–2022（需要 Twitter API v2 Academic 访问，可用 `tweets/search/all`）
+- 时间范围：
+  - Academic 权限：2006–2022（使用 `tweets/search/all` 端点）
+  - Basic Plan：最近 7 天（使用 `users/:id/tweets` 端点）
 - 抓取原始推文与转发
 - 情绪分析：VADER，输出带正负号的分数
 ```

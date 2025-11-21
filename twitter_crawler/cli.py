@@ -125,7 +125,6 @@ def tweets_fetch(
     value: str = typer.Option(..., "--value", help="账号名（不含@）或关键字"),
     start: str = typer.Option(None, "--start", help="开始日期（YYYY-MM-DD）"),
     end: str = typer.Option(None, "--end", help="结束日期（YYYY-MM-DD）"),
-    include_retweets: bool = typer.Option(True, "--include-retweets", help="是否包含转推"),
     output: str = typer.Option("tweets_with_sentiment.csv", "--output", "-o"),
 ):
     """
@@ -143,11 +142,8 @@ def tweets_fetch(
         query = f"from:{value}"
     else:
         query = value
-    if include_retweets:
-        # 保留原推 + 转推
-        pass
-    else:
-        query += " -is:retweet"
+    # 默认排除转推
+    query += " -is:retweet"
 
     # 日期转 ISO8601
     start_iso = f"{start}T00:00:00Z" if start else None
